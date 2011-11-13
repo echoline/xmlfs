@@ -1,0 +1,12 @@
+int xml_init(char*);
+void xml_reset(void*);
+int xml_nth_child(void *,int child);
+int xml_next(void *);
+int xml_valid(void *);
+char* xml_n(void*);
+char* xml_name(void*);
+char* xml_content(void *p);
+void xml_create(void *, char *);
+int xml_write(void *, char *, int);
+void xml_parent(void*);
+void xml_remove(void*);
