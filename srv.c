@@ -9,6 +9,13 @@
 #include <ixp_srvutil.h>
 #include "fns.h"
 
+enum {
+	Qstart,
+	Qcontinue,
+	Qcontents,
+	Qdone,
+};
+
 static bool isdigits(char *string) {
 	char *p = string;
 
@@ -24,7 +31,7 @@ static bool isdigits(char *string) {
 void mkstat(IxpStat *s, char *name) {
 	memset(s, 0, sizeof(IxpStat));
 	s->mode = 0777;
-	s->qid.type = 0;
+	s->qid.type = P9_QTFILE;
 	s->name = name? name: "error";
 	s->uid = s->gid = s->muid = "eli"; // TODO XXX
 }
@@ -68,32 +75,45 @@ static void fs_walk(Ixp9Req *r) {
 	char name[PATH_MAX] = "\0";
 
 	debug("fs_walk(%p)\n", r);
+	debug("fs_walk %d\n", xml_get_state(r));
 
-	xml_reset((void*)r);
+	if (xml_get_state((void*)r) == Qdone) {
+		xml_set_state((void*)r, Qstart);
+		xml_last((void*)r);
+//		xml_next((void*)r);
+	}
 
 	for (i = 0; i < r->ifcall.twalk.nwname; i++) {
 		strncpy(name, r->ifcall.twalk.wname[i], PATH_MAX-1);
-		name[strcspn(name, "_")] = '\0';
 		debug("fs_walk %s\n", name);
-		if (isdigits(name)) {
+		name[strcspn(name, "_")] = '\0';
+		if (strcmp(name, ".") == 0) {
+			continue;
+		} else if (strcmp(name, "..") == 0) {
+			xml_last((void*)r);
+		} else if (isdigits(name)) {
 			n = atoi(name);
 			if (xml_nth_child((void*)r, n) == 0) {
-				ixp_respond(r, "does not exist");
+				debug("fs_walk wtf0 %d %s\n", xml_get_state((void*)r), xml_n((void*)r));
+				xml_last((void*)r);
+				ixp_respond(r, "file not found");
 				return;
 			}
 			r->ofcall.rwalk.wqid[i].type = P9_QTDIR;
-//			r->ofcall.rwalk.wqid[i].path |= n << (i * 8);
+			xml_set_state((void*)r, Qstart);
 		} else if (strcmp(name, "contents") == 0) {
 			r->ofcall.rwalk.wqid[i].type = P9_QTFILE;
-			r->newfid->aux = (void*)2;
-			
-			r->ofcall.rwalk.nwqid = i+1;
 
-			ixp_respond(r, NULL);
+			if (xml_valid((void*)r))
+				xml_set_state((void*)r, Qcontents);
 			
-			return;
+			i++;
+			break;
+
 		} else {
-			ixp_respond(r, "does not exist");
+			debug("fs_walk wtf1 %d %s\n", xml_get_state((void*)r), xml_n((void*)r));
+			//xml_reset((void*)r);
+			ixp_respond(r, "file not found");
 			return;
 		}
 	}
@@ -110,18 +130,32 @@ static void fs_read(Ixp9Req *r) {
 	int size;
 
 	debug("fs_read(%p)\n", r);
+	debug("fs_read %d %s\n", xml_get_state((void*)r), xml_n((void*)r));
+
+	r->ofcall.rread.data = NULL;
+	r->ofcall.rread.count = 0;
 
 	// one-time thingy
-	if ((int)r->fid->aux == 0) {
-		xml_nth_child((void*)r, 0);
-		r->fid->aux = (void*)1;
+	if (xml_get_state((void*)r) == Qstart) {
+		if (xml_nth_child((void*)r, 0) != 0)
+			xml_set_state((void*)r, Qcontinue);
+		else
+			xml_set_state((void*)r, Qdone);
 	}
 
-	if (xml_valid((void*)r)) {
-		if ((int)r->fid->aux == 1) {
+	if (xml_get_state((void*)r) == Qdone) {
+		xml_last(r);
+//		xml_reset((void*)r);
+//		xml_next((void*)r);
+//		xml_set_state((void*)r, Qcontinue);
+		xml_set_state((void*)r, Qstart);
+		r->ofcall.rread.data = ixp_estrdup("");
+		debug("fs_read done1, ptr: %s\n", xml_n((void*)r));
+	} else if (xml_valid((void*)r)) {
+		if (xml_get_state((void*)r) == Qcontinue) {
 			mkstat(&s, xml_n((void*)r));
 			s.mode |= P9_DMDIR;
-			s.qid.type |= P9_QTDIR;
+			s.qid.type = P9_QTDIR;
 			size = ixp_sizeof_stat(&s);
 
 			buf = ixp_emallocz(size);
@@ -133,18 +167,17 @@ static void fs_read(Ixp9Req *r) {
 			r->ofcall.rread.count = size;
 
 			xml_next((void*)r);
-		} else if ((int)r->fid->aux == 2) {
+		} else if (xml_get_state((void*)r) == Qcontents) {
+
 			buf = xml_content((void*)r);
 			r->ofcall.rread.data = buf;
 			r->ofcall.rread.count = strlen(buf);
-			r->fid->aux = (void*)3;
+			xml_set_state((void*)r, Qdone);
 		} else {
-			r->ofcall.rread.data = NULL;
-			r->ofcall.rread.count = 0;
+			debug("fs_read wtf %d %s\n", xml_get_state((void*)r), xml_n((void*)r));
 		}
-	} else if ((int)r->fid->aux < 2) {
+	} else if (xml_get_state((void*)r) == Qcontinue) {
 		mkstat(&s, "contents");
-		s.qid.type = P9_QTFILE;
 		size = ixp_sizeof_stat(&s);
 
 		buf = ixp_emallocz(size);
@@ -155,16 +188,16 @@ static void fs_read(Ixp9Req *r) {
 		r->ofcall.rread.data = m.data;
 		r->ofcall.rread.count = size;
 		
-		r->fid->aux = (void*)2;
+		xml_set_state((void*)r, Qdone);
+		xml_last((void*)r);
+
 	} else {
-		r->ofcall.rread.data = NULL;
-		r->ofcall.rread.count = 0;
+		debug("fs_read wtf %d\n", xml_get_state((void*)r));
 	}
 
 	ixp_respond(r, NULL);
 }
 
-// clean this shit up dammit
 static void fs_stat(Ixp9Req *r) {
 	IxpStat s;
 	int size;
@@ -175,13 +208,21 @@ static void fs_stat(Ixp9Req *r) {
 	debug("fs_stat(%p)\n", r);
 
 	n = xml_n((void*)r);
+
+	debug("fs_stat %d %s\n", xml_get_state((void*)r), n);
+
 	if (n != NULL) {
-		mkstat(&s, n);
-		s.mode |= P9_DMDIR;
-		s.qid.type = P9_QTDIR;
+		if (xml_get_state((void*)r) == Qcontents) {
+			mkstat(&s, "contents");
+		} else {
+			mkstat(&s, n);
+			s.mode |= P9_DMDIR;
+			s.qid.type = P9_QTDIR;
+		}
 	} else {
-		mkstat(&s, "contents");
-		s.qid.type = P9_QTFILE;
+		ixp_respond(r, "file not found");
+
+		return;
 	}
 
 	r->fid->qid = s.qid;
@@ -193,6 +234,7 @@ static void fs_stat(Ixp9Req *r) {
 	ixp_pstat(&m, &s);
 
 	r->ofcall.rstat.stat = m.data;
+
 	ixp_respond(r, NULL);
 }
 
@@ -205,7 +247,12 @@ static void fs_write(Ixp9Req *r) {
 }
 
 static void fs_clunk(Ixp9Req *r) {
+	int state = xml_get_state((void*)r);
+
 	debug("fs_clunk(%p)\n", r);
+
+	xml_reset((void*)r);
+	xml_set_state((void*)r, Qdone);
 
 	ixp_respond(r, NULL);
 }
@@ -219,6 +266,9 @@ static void fs_flush(Ixp9Req *r) {
 static void fs_attach(Ixp9Req *r) {
 	debug("fs_attach(%p)\n", r);
 
+	xml_reset((void*)r);
+
+	xml_set_state((void*)r, Qstart);
 	r->fid->qid.type = P9_QTDIR;
 	r->fid->qid.path = (uintptr_t)r->fid;
 	r->ofcall.rattach.qid = r->fid->qid;

@@ -10,3 +10,7 @@ void xml_create(void *, char *);
 int xml_write(void *, char *, int);
 void xml_parent(void*);
 void xml_remove(void*);
+void xml_last(void*);
+int xml_index(void*);
+int xml_get_state(void *p);
+void xml_set_state(void *p, int i);
